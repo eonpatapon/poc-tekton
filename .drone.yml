@@ -1,0 +1,85 @@
+kind: pipeline
+type: kubernetes
+name: default
+
+steps:
+  - name: test-build
+    image: golang:1.13
+    commands:
+    - go test -v
+    - go build -v -o main .
+
+  - name: build-docker
+    image: banzaicloud/drone-kaniko
+    settings:
+      username: eonpatapon
+      password:
+        from_secret: DOCKER_PASSWORD
+      repo: eonpatapon/poc-tekton
+      tags: ${DRONE_COMMIT:0:8}
+
+  - name: deploy-dev
+    image: nixery.dev/shell/kubectl/yq
+    environment:
+      KUBERNETES_TOKEN:
+        from_secret: KUBERNETES_DEV_TOKEN
+    commands:
+      - export NS=poc-tekton-pr-${DRONE_PULL_REQUEST}
+      - export IMAGE="eonpatapon/poc-tekton:${DRONE_COMMIT:0:8}"
+      - yq 'select(.kind == "Deployment") | .spec.template.spec.containers[0].image = env.IMAGE | .metadata.namespace = env.NS' deployment.yaml > updated-deployment.yaml
+      - kubectl --token "$${KUBERNETES_TOKEN}" create ns $${NS} || true
+      - kubectl --token "$${KUBERNETES_TOKEN}" apply -f updated-deployment.yaml
+      - yq 'select(.kind == "Service") | .metadata.namespace = env.NS' deployment.yaml | kubectl --token "$${KUBERNETES_TOKEN}" apply -f -
+    when:
+      event:
+        - pull_request
+
+  - name: test
+    image: nixery.dev/shell/curl/gnugrep
+    commands:
+      - export NS=poc-tekton-pr-${DRONE_PULL_REQUEST}
+      - |
+        count=0
+        while :
+        do
+          if curl http://hello-world.$${NS} | grep -q "hello world"; then exit 0; fi
+          sleep .5
+          count=$(( count + 1 ))
+          [ $count -gt 9 ] && exit 1
+        done
+    when:
+      event:
+        - pull_request
+
+trigger:
+  branch:
+  - master
+  event:
+  - pull_request
+
+---
+kind: pipeline
+type: kubernetes
+name: promote-prod
+
+steps:
+  - name: deploy-prod
+    image: nixery.dev/shell/kubectl/yq
+    environment:
+      KUBERNETES_TOKEN:
+        from_secret: KUBERNETES_DEV_TOKEN
+    commands:
+      - export IMAGE="eonpatapon/poc-tekton:${DRONE_COMMIT:0:8}"
+      - yq 'select(.kind == "Service")' deployment.yaml | kubectl --token "$${KUBERNETES_TOKEN}" apply -f -
+      - yq 'select(.kind == "Deployment") | .spec.template.spec.containers[0].image = env.IMAGE' deployment.yaml | kubectl --token "$${KUBERNETES_TOKEN}" apply -f -
+    when:
+      event:
+        - promote
+      target:
+        - production
+
+trigger:
+  event:
+  - promote
+  target:
+  - production
